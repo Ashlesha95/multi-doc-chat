@@ -7,7 +7,7 @@ from dotenv import load_dotenv
 from langchain_community.vectorstores import Chroma
 from langchain_groq import ChatGroq
 
-from config import get_embeddings
+from config import get_embeddings, get_reranker
 
 load_dotenv()
 
@@ -15,7 +15,9 @@ load_dotenv()
 MAIN_MODEL = os.getenv("GROQ_MAIN_MODEL", "openai/gpt-oss-120b")
 FAST_MODEL = os.getenv("GROQ_FAST_MODEL", "openai/gpt-oss-20b")
 
-TOTAL_CHUNKS = 12
+TOTAL_CHUNKS = 12          # passages finally sent to the LLM
+USE_RERANKER = os.getenv("USE_RERANKER", "true").lower() not in ("0", "false", "no")
+RERANK_CANDIDATES = 20     # passages fetched PER DOCUMENT, then reranked down to TOTAL_CHUNKS
 MAX_SUMMARY_CHUNKS = 30
 HISTORY_MESSAGES = 6
 MAX_MSG_CHARS = 600
@@ -258,6 +260,26 @@ def _query_store(path: str, embedding: list, k: int, where):
     return list(zip(res["documents"][0], res["metadatas"][0], res["distances"][0]))
 
 
+def _rerank(query: str, hits: list) -> list:
+    """Re-score (distance, doc, text, meta) hits with a cross-encoder, best first.
+    A cross-encoder reads the question and each passage TOGETHER, so it judges
+    relevance far better than vector distance alone. Falls back to vector order
+    if the reranker is off or fails."""
+    by_distance = sorted(hits, key=lambda h: h[0])
+    if not USE_RERANKER or len(hits) < 2:
+        return by_distance
+    try:
+        scores = [float(x) for x in get_reranker().rerank(query, [h[2] for h in hits])]
+    except Exception as e:
+        print(f"Rerank failed, falling back to vector order: {e}")
+        return by_distance
+    ranked = sorted(zip(scores, hits), key=lambda p: p[0], reverse=True)
+    cutoff = ranked[min(TOTAL_CHUNKS, len(ranked)) - 1][0]
+    print(f"Rerank: {len(hits)} candidates -> top score {ranked[0][0]:.2f}, "
+          f"cutoff (#{min(TOTAL_CHUNKS, len(ranked))}) {cutoff:.2f}")
+    return [h for _, h in ranked]
+
+
 def _search_documents(doc_paths: dict, query: str, chapter=None,
                       limits=None, route: bool = True,
                       balance: bool = False) -> list:
@@ -265,13 +287,14 @@ def _search_documents(doc_paths: dict, query: str, chapter=None,
     balance=True guarantees every document a fair share of the returned passages."""
     limits = limits or {}
     embedding = get_embeddings().embed_query(query)  # embedded once
+    n_candidates = RERANK_CANDIDATES if USE_RERANKER else TOTAL_CHUNKS
 
     def run(chapter_filter):
         hits = []  # (distance, doc_name, text, metadata)
         for doc_name, path in doc_paths.items():
             try:
                 rows = _query_store(
-                    path, embedding, TOTAL_CHUNKS,
+                    path, embedding, n_candidates,
                     _build_filter(chapter_filter, limits.get(doc_name)),
                 )
             except Exception as e:
@@ -298,7 +321,10 @@ def _search_documents(doc_paths: dict, query: str, chapter=None,
               f"{ {n: round(b, 3) for n, b in best.items()} } -> keeping {sorted(keep)}")
         hits = [h for h in hits if h[1] in keep]
 
-    hits.sort(key=lambda h: h[0])
+    # order candidates by cross-encoder relevance (vector distance if reranking is off).
+    # Spoiler-safe filtering already happened in the vector query, so the reranker
+    # never sees passages the reader isn't allowed to see.
+    hits = _rerank(query, hits)
 
     if balance and len(doc_paths) > 1:
         # round-robin across documents (best match first within each) so a single
