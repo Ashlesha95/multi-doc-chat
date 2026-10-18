@@ -1,0 +1,52 @@
+### IntelliJ IDEA ###
+out/
+!**/src/main/**/out/
+!**/src/test/**/out/
+.kotlin
+
+.env
+.env.local
+vectorstore/
+__pycache__/
+*.pyc
+
+.chainlit/
+chainlit.md
+
+
+
+bash
+git add .gitignore
+git commit -m "Update .gitignore"
+git push origin feature-rag-chatbot
+Those files will stay on your local machine but never go to GitHub. That's totally normal — .gitignore exists exactly for this purpose.
+
+
+
+Want to b
+
+
+### Eclipse ###
+.apt_generated
+.classpath
+.factorypath
+.project
+.settings
+.springBeans
+.sts4-cache
+bin/
+!**/src/main/**/bin/
+!**/src/test/**/bin/
+
+### NetBeans ###
+/nbproject/private/
+/nbbuild/
+/dist/
+/nbdist/
+/.nb-gradle/
+
+### VS Code ###
+.vscode/
+
+### Mac OS ###
+.DS_Store
