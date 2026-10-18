@@ -6,7 +6,7 @@ from langchain_community.embeddings.fastembed import FastEmbedEmbeddings
 
 load_dotenv()  # so RERANK_MODEL etc. from .env are visible when this module loads
 
-EMBED_MODEL = "BAAI/bge-small-en-v1.5"
+EMBED_MODEL = "BAAI/bge-small-en-v1.5"  
 
 # Cross-encoder used to rerank retrieved passages (runs locally via FastEmbed).
 # Small + fast by default (~80 MB). For higher accuracy try "BAAI/bge-reranker-base" (~1 GB)
