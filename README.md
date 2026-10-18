@@ -38,6 +38,7 @@ Upload your books or documents, start a chat with any combination of them, and g
 | 📎 | **Cited answers** | Every answer is backed by numbered passages. Open *Show sources* to read the excerpts and see the PDF page with the passage highlighted. |
 | ✅ | **Answer check** | Each sentence is compared with the passage it cites using local embeddings. Weakly supported sentences get flagged. |
 | 🛡️ | **Spoiler-safe mode** | Say how far you've read in each book (by chapter) and answers only use text up to that point. |
+| 🎖️ | **Reranking** | Retrieval pulls a wide set of candidate passages, then a local cross-encoder reads the question and each passage together and keeps only the best ones. Noticeably better relevance than vector search alone. |
 | 🧠 | **Smart retrieval** | Follow-ups are rewritten into standalone queries, chapter requests are detected (*"summarize Chapter 3"*), and unrelated documents are filtered out for specific questions. |
 | 💾 | **Persistent chats** | Conversations are saved locally as JSON, so you can reopen or delete them from the sidebar. |
 | 🔒 | **Local embeddings** | Documents are embedded on your machine with FastEmbed. Only the retrieved passages are sent to the LLM. |
@@ -52,7 +53,7 @@ Upload your books or documents, start a chat with any combination of them, and g
                                                                     │
   ┌────────────┐      ┌───────────────────────────┐                 │
   │  Question  │ ───▶ │  rag.py                   │ ◀───────────────┘
-  │            │      │  pick docs + retrieve     │
+  │            │      │  route, retrieve, rerank  │
   └────────────┘      └─────────────┬─────────────┘
                                     │
                                     ▼
@@ -64,7 +65,7 @@ Upload your books or documents, start a chat with any combination of them, and g
 ```
 
 1. **Ingest** (`ingest.py`): loads each PDF with PyMuPDF, tags every page with its chapter, splits the text into ~500-character chunks, embeds them with `BAAI/bge-small-en-v1.5` (locally, via FastEmbed) and saves them in a per-document Chroma store.
-2. **Retrieve** (`rag.py`): decides which documents to search, runs a vector search, and keeps a fair share of passages from every document when you ask about several.
+2. **Retrieve + rerank** (`rag.py`): decides which documents to search, pulls the top 20 candidate passages per document by vector search, then a cross-encoder reranker re-scores them and keeps the best 12. When you ask about several documents, each one keeps a fair share.
 3. **Answer** (`rag.py`): sends the numbered passages to a Groq-hosted model, which answers and cites them as `[1]`, `[2]`, …
 4. **Verify** (`rag.py`): builds the source list from the citations and scores each sentence against the passages it cites.
 
@@ -97,6 +98,8 @@ GROQ_API_KEY=your_key_here
 # optional: override the default models
 # GROQ_MAIN_MODEL=openai/gpt-oss-120b
 # GROQ_FAST_MODEL=openai/gpt-oss-20b
+# USE_RERANKER=true
+# RERANK_MODEL=Xenova/ms-marco-MiniLM-L-6-v2
 ```
 
 ### Run
@@ -105,7 +108,7 @@ GROQ_API_KEY=your_key_here
 streamlit run chatapp.py
 ```
 
-> 💡 The first run downloads the embedding model into `model_cache/`, so it takes a little longer.
+> 💡 The first run downloads the embedding model and the reranker into `model_cache/` (roughly 150 MB in total), so it takes a little longer.
 
 ## 💬 Usage
 
@@ -130,7 +133,7 @@ multi-doc-chat/
 ├── chatapp.py       # Streamlit UI: uploads, chats, spoiler-safe mode, sources popup
 ├── rag.py           # retrieval, document routing, prompting, citations, answer check
 ├── ingest.py        # PDF loading, chapter detection, chunking, embedding, indexing
-├── config.py        # shared embedding model setup
+├── config.py        # shared embedding model + reranker setup
 ├── chat_store.py    # saves and loads chats as JSON
 ├── viewer.py        # renders a PDF page with the cited passage highlighted
 │
@@ -153,7 +156,10 @@ These live at the top of `rag.py` and `ingest.py`:
 | --- | --- | --- | --- |
 | `GROQ_MAIN_MODEL` | env / `rag.py` | `openai/gpt-oss-120b` | Model that writes answers |
 | `GROQ_FAST_MODEL` | env / `rag.py` | `openai/gpt-oss-20b` | Model that rewrites follow-up questions |
-| `TOTAL_CHUNKS` | `rag.py` | `12` | Passages sent to the model per question |
+| `TOTAL_CHUNKS` | `rag.py` | `12` | Passages sent to the model per question (after reranking) |
+| `RERANK_CANDIDATES` | `rag.py` | `20` | Candidate passages fetched per document before reranking |
+| `USE_RERANKER` | env / `rag.py` | `true` | Set to `false` to skip reranking and use plain vector search |
+| `RERANK_MODEL` | env / `config.py` | `Xenova/ms-marco-MiniLM-L-6-v2` | Cross-encoder used for reranking. For higher accuracy try `BAAI/bge-reranker-base` (~1 GB, slower) |
 | `OVERVIEW_PER_DOC` | `rag.py` | `6` | Passages sampled per document for "tell me about all the books" |
 | `DOC_MARGIN` | `rag.py` | `0.10` | How much worse a document's best match can be before it is dropped for specific questions |
 | `GROUNDING_THRESHOLD` | `rag.py` | `0.60` | Below this similarity, an answer sentence is flagged as weakly supported |
@@ -187,6 +193,15 @@ Some models use their own citation format instead of `[7]`. The app converts the
 <br/>
 
 Chapter detection looks for lines starting with *Chapter …*, *Prologue* or *Epilogue*. PDFs that use different headings can't be limited by chapter.
+
+</details>
+
+<details>
+<summary><b>Reranker errors or is slow</b></summary>
+
+<br/>
+
+If you see `Rerank failed, falling back to vector order` in the terminal, the app keeps working with plain vector search. Usually the fix is `pip install -U fastembed` (older versions have no reranker) or checking your internet connection for the first model download. To switch reranking off entirely, set `USE_RERANKER=false` in `.env`. The terminal prints a `Rerank: N candidates -> ...` line for each question when it is active.
 
 </details>
 
