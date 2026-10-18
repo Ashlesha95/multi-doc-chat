@@ -6,6 +6,7 @@ import numpy as np
 from dotenv import load_dotenv
 from langchain_community.vectorstores import Chroma
 from langchain_groq import ChatGroq
+
 from config import get_embeddings
 
 load_dotenv()
@@ -13,15 +14,16 @@ load_dotenv()
 # ── Settings ──────────────────────────────────────────────
 MAIN_MODEL = os.getenv("GROQ_MAIN_MODEL", "openai/gpt-oss-120b")
 FAST_MODEL = os.getenv("GROQ_FAST_MODEL", "openai/gpt-oss-20b")
+
 TOTAL_CHUNKS = 12
 MAX_SUMMARY_CHUNKS = 30
 HISTORY_MESSAGES = 6
 MAX_MSG_CHARS = 600
 EXCERPT_CHARS = 350
-GROUNDING_THRESHOLD = 0.60   # below this, a sentence is flagged as weakly supported
-DOC_MARGIN = 0.10            # a book is dropped if its best match is this much worse
+GROUNDING_THRESHOLD = 0.60  # below this, a sentence is flagged as weakly supported
+DOC_MARGIN = 0.10           # a book is dropped if its best match is this much worse
 # than the best book (lower = stricter, higher = looser)
-UNCITED_SHOWN = 3            # passages shown when the answer cites nothing
+UNCITED_SHOWN = 3           # passages shown when the answer cites nothing
 
 CHAPTER_RE = re.compile(r"\b(prologue|epilogue|chapter\s+[\w-]+)", re.IGNORECASE)
 SUMMARY_WORDS = ("summary", "summarize", "summarise", "what happens",
@@ -44,7 +46,50 @@ ORDINAL_RE = re.compile(
     re.IGNORECASE,
 )
 ORDINALS = {"first": 0, "1st": 0, "second": 1, "2nd": 1, "third": 2, "3rd": 2}
+
+# "all three documents", "every book", "each file", "all of them", "the 3 books":
+# the user wants EVERY selected document covered.
+ALL_DOCS_RE = re.compile(
+    r"\b(?:all|every|each)\b(?:\s+(?:of|the|these|those|my|our|\d+|two|three|four|five|six))*\s*"
+    r"(?:books?|documents?|docs?|pdfs?|files?|novels?|texts?|them)\b"
+    r"|\b(?:two|three|four|five|six|\d+)\s+(?:books?|documents?|docs?|pdfs?|files?|novels?)\b",
+    re.IGNORECASE,
+)
+OVERVIEW_PER_DOC = 6  # passages sampled per document for "tell me about all the books"
+
+# plural collection nouns ("the books", "these documents") mean the whole chat
+COLLECTION_RE = re.compile(
+    r"\b(books|documents|docs|pdfs|files|novels|texts)\b", re.IGNORECASE
+)
+# words that carry no topic: if nothing else is left, the question is a pure
+# "tell me about / summarize everything" request
+FILLER = {
+    "tell", "me", "about", "all", "the", "these", "those", "of", "them", "each",
+    "every", "my", "our", "a", "an", "and", "please", "can", "you", "could",
+    "give", "overview", "summary", "summarize", "summarise", "recap", "describe",
+    "what", "are", "is", "happens", "in", "on", "to", "for", "one", "two",
+    "three", "four", "five", "six", "i", "uploaded", "here", "chat", "show",
+    "explain", "briefly", "quickly", "it", "this", "that", "do", "does", "say",
+}
+
+
+def _is_topicless(question: str) -> bool:
+    """True if the question names no specific topic, e.g. 'tell me about all three docs'."""
+    q = GENERIC_RE.sub(" ", question.lower())
+    tokens = re.findall(r"[a-z']+|\d+", q)
+    return all(t in FILLER or t.isdigit() for t in tokens)
+
+# Our own citation format: [3] or [1, 2]
 CITE_RE = re.compile(r"\[(\d+(?:\s*,\s*\d+)*)\]")
+
+# gpt-oss models were trained with a browsing-tool citation format like
+# 【7†L1-L6】 (also seen as [7†source], 【7†L1-L6†L9-L12】). Convert to [7].
+ALT_CITE_RE = re.compile(r"[【\[]\s*(\d+)\s*†[^】\]]*[】\]]")
+
+
+def normalize_citations(text: str) -> str:
+    """Rewrite model-native citation markers (【7†L1-L6】) into our [7] format."""
+    return ALT_CITE_RE.sub(lambda m: f"[{m.group(1)}]", text or "")
 
 
 # ── Cached resources ──────────────────────────────────────
@@ -67,7 +112,7 @@ def get_vectorstore(path: str):
 @lru_cache(maxsize=32)
 def get_chapters(path: str) -> list:
     """Chapters of one document in reading order:
-    [{"name": "Chapter One", "first": 3, "last": 17}, ...]  (0-based page indexes)."""
+    [{"name": "Chapter One", "first": 3, "last": 17}, ...] (0-based page indexes)."""
     try:
         data = get_vectorstore(path).get(include=["metadatas"])
     except Exception as e:
@@ -94,7 +139,8 @@ def _format_history(chat_history: list) -> str:
     lines = []
     for msg in chat_history[-HISTORY_MESSAGES:]:
         role = "User" if msg["role"] == "user" else "Assistant"
-        content = CITE_RE.sub("", msg["content"]).strip()
+        # normalize first so old malformed citations don't leak into the prompt
+        content = CITE_RE.sub("", normalize_citations(msg["content"])).strip()
         if len(content) > MAX_MSG_CHARS:
             content = content[:MAX_MSG_CHARS] + "..."
         lines.append(f"{role}: {content}")
@@ -129,23 +175,27 @@ def _strip_generic(query: str) -> str:
     return cleaned if len(cleaned.split()) >= 3 else query
 
 
-def _target_docs(question: str, doc_paths: dict) -> dict:
-    """If the user names a document (or says 'first/second book'), search only that one."""
+def _target_docs(question: str, doc_paths: dict):
+    """Returns (docs_to_search, explicit).
+    Narrows to specific documents ONLY if the user names one (whole-word match on
+    the file name) or says 'first/second book'. Otherwise returns every document
+    in the chat with explicit=False."""
     if len(doc_paths) <= 1:
-        return doc_paths
-    q = question.lower().replace("_", " ").replace("-", " ")
+        return doc_paths, False
+    q = " ".join(question.lower().replace("_", " ").replace("-", " ").split())
     mentioned = {}
     for name, path in doc_paths.items():
-        stem = os.path.splitext(name)[0].lower().replace("_", " ").replace("-", " ")
-        if len(stem) >= 3 and stem in q:
+        stem = " ".join(os.path.splitext(name)[0].lower()
+                        .replace("_", " ").replace("-", " ").split())
+        # whole-word match, so a file called "book" isn't triggered by "books"
+        if len(stem) >= 3 and re.search(rf"(?<!\w){re.escape(stem)}(?!\w)", q):
             mentioned[name] = path
     if mentioned:
-        return mentioned
-
+        return mentioned, True
     names = list(doc_paths.keys())
     picks = {ORDINALS[m.group(1).lower()] for m in ORDINAL_RE.finditer(question)}
     chosen = {names[i]: doc_paths[names[i]] for i in picks if i < len(names)}
-    return chosen or doc_paths
+    return (chosen, True) if chosen else (doc_paths, False)
 
 
 def _detect_chapter(question: str):
@@ -209,13 +259,15 @@ def _query_store(path: str, embedding: list, k: int, where):
 
 
 def _search_documents(doc_paths: dict, query: str, chapter=None,
-                      limits=None, route: bool = True) -> list:
-    """Search all selected documents, then drop documents that don't match well."""
+                      limits=None, route: bool = True,
+                      balance: bool = False) -> list:
+    """Search all selected documents, then drop documents that don't match well.
+    balance=True guarantees every document a fair share of the returned passages."""
     limits = limits or {}
-    embedding = get_embeddings().embed_query(query)   # embedded once
+    embedding = get_embeddings().embed_query(query)  # embedded once
 
     def run(chapter_filter):
-        hits = []   # (distance, doc_name, text, metadata)
+        hits = []  # (distance, doc_name, text, metadata)
         for doc_name, path in doc_paths.items():
             try:
                 rows = _query_store(
@@ -247,6 +299,30 @@ def _search_documents(doc_paths: dict, query: str, chapter=None,
         hits = [h for h in hits if h[1] in keep]
 
     hits.sort(key=lambda h: h[0])
+
+    if balance and len(doc_paths) > 1:
+        # round-robin across documents (best match first within each) so a single
+        # book can't crowd the others out of the top-N
+        queues = {}
+        for dist, name, text, meta in hits:
+            queues.setdefault(name, []).append((text, meta))
+        results, seen = [], set()
+        while queues and len(results) < TOTAL_CHUNKS:
+            for name in list(queues):
+                while queues[name]:
+                    text, meta = queues[name].pop(0)
+                    if (name, text) not in seen:
+                        seen.add((name, text))
+                        results.append(_make_entry(name, meta, text))
+                        break
+                if not queues[name]:
+                    del queues[name]
+                if len(results) >= TOTAL_CHUNKS:
+                    break
+        order = list(doc_paths)  # group by document so the prompt reads cleanly
+        results.sort(key=lambda e: order.index(e["doc"]))
+        return results
+
     results, seen = [], set()
     for dist, name, text, meta in hits:
         key = (name, text)
@@ -282,6 +358,30 @@ def _get_chapter_chunks(doc_paths: dict, chapter: str, limits=None) -> list:
     return results
 
 
+def _sample_document_chunks(doc_paths: dict, per_doc: int, limits=None) -> list:
+    """Evenly spaced passages (beginning -> end) from EVERY document, for
+    overview questions like 'tell me about all three books'."""
+    limits = limits or {}
+    results = []
+    for doc_name, path in doc_paths.items():
+        try:
+            data = get_vectorstore(path).get(
+                where=_build_filter(None, limits.get(doc_name)))
+        except Exception as e:
+            print(f"Sample error in {doc_name}: {e}")
+            continue
+        entries = [
+            _make_entry(doc_name, m, t)
+            for t, m in zip(data.get("documents") or [], data.get("metadatas") or [])
+        ]
+        entries.sort(key=lambda e: (e["page"] or 0, e["para"] or 0))
+        if len(entries) > per_doc:
+            step = len(entries) / per_doc
+            entries = [entries[int(i * step)] for i in range(per_doc)]
+        results.extend(entries)
+    return results
+
+
 def _build_sources(answer: str, chunks: list) -> list:
     """Cited passages only. If nothing was cited, show just the few closest ones."""
     cited = set()
@@ -289,7 +389,6 @@ def _build_sources(answer: str, chunks: list) -> list:
         for x in re.split(r"\s*,\s*", m.group(1)):
             if x.isdigit() and 1 <= int(x) <= len(chunks):
                 cited.add(int(x))
-
     chosen = sorted(cited) if cited else range(1, min(UNCITED_SHOWN, len(chunks)) + 1)
     sources = []
     for n in chosen:
@@ -310,7 +409,6 @@ def _grounding_check(answer: str, chunks: list) -> list:
     if not CITE_RE.search(answer) or not chunks:
         return []
     emb = get_embeddings()
-
     sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+|\n+", answer) if s.strip()]
     items = []
     for s in sentences:
@@ -354,28 +452,48 @@ def smart_answer(doc_paths: dict, question: str, chat_history: list = None,
     """
     chat_history = chat_history or []
     limits = {k: v for k, v in (limits or {}).items() if v is not None}
-    doc_paths = _target_docs(question, doc_paths)
+    doc_paths, explicit = _target_docs(question, doc_paths)
+    is_summary = any(w in question.lower() for w in SUMMARY_WORDS)
+    topicless = _is_topicless(question)
+    # Unless the user named one document, every document in this chat must be covered
+    wants_all = (len(doc_paths) > 1 and not explicit and (
+            bool(ALL_DOCS_RE.search(question))
+            or bool(COLLECTION_RE.search(question))
+            or (is_summary and topicless)
+    ))
 
+    # the rewriter can drop "all three" and drift toward earlier topics, so skip it
     search_query = (_rewrite_query(question, chat_history)
-                    if _needs_rewrite(question, chat_history) else question)
+                    if not wants_all and _needs_rewrite(question, chat_history)
+                    else question)
     search_query = _strip_generic(search_query)
     print(f"Search query: {search_query}")
 
     chapter = _detect_chapter(search_query) or _detect_chapter(question)
-    is_summary = any(w in question.lower() for w in SUMMARY_WORDS)
     is_comparison = bool(COMPARE_RE.search(question))
+    overview = wants_all and is_summary and topicless and not chapter
+    print(f"Docs in play: {list(doc_paths)} | explicit={explicit} "
+          f"wants_all={wants_all} overview={overview}")
 
     if limits and chapter and _chapter_locked(doc_paths, chapter, limits):
         return ("🔒 Spoiler-safe mode is on, and that chapter is beyond where you've "
                 "read so far. Move your reading progress forward to unlock it.", [], [])
 
-    if chapter and is_summary:
+    spread = is_comparison or wants_all  # every selected doc must stay in play
+
+    if overview:
+        # "tell me about all three books": a semantic query like "tell me about
+        # all three" matches nothing meaningful, so sample evenly from every doc
+        chunks = _sample_document_chunks(doc_paths, OVERVIEW_PER_DOC, limits) or \
+                 _search_documents(doc_paths, search_query, None, limits,
+                                   route=False, balance=True)
+    elif chapter and is_summary:
         chunks = _get_chapter_chunks(doc_paths, chapter, limits) or \
                  _search_documents(doc_paths, search_query, None, limits,
-                                   route=not is_comparison)
+                                   route=not spread, balance=spread)
     else:
         chunks = _search_documents(doc_paths, search_query, chapter, limits,
-                                   route=not is_comparison)
+                                   route=not spread, balance=spread)
 
     if not chunks:
         return ("I couldn't find anything relevant in the part of the documents "
@@ -384,7 +502,6 @@ def smart_answer(doc_paths: dict, question: str, chat_history: list = None,
 
     # only the documents that actually made it into the context are named in the prompt
     doc_names = list(dict.fromkeys(c["doc"] for c in chunks))
-
     context = "\n\n---\n\n".join(
         f"{_header(i, c)}\n{c['text']}" for i, c in enumerate(chunks, 1)
     )
@@ -397,17 +514,28 @@ def smart_answer(doc_paths: dict, question: str, chat_history: list = None,
     )
     summary_rule = ("- This is a request to summarize a chapter: give a coherent "
                     "summary in story order." if chapter and is_summary else "")
+    all_rule = ""
+    if wants_all:
+        all_rule = (f"- The user asked about ALL of these documents: {', '.join(doc_paths)}. "
+                    "Cover EACH one in its own short section and don't skip any.")
+        missing = [d for d in doc_paths if d not in doc_names]
+        if missing:
+            all_rule += (f" No passages were found for: {', '.join(missing)}; "
+                         "say that plainly instead of guessing.")
 
     prompt = f"""You are a helpful, conversational assistant helping someone understand
 these documents: {", ".join(doc_names)}.
 The user may call them books, documents, PDFs or files. These all mean the same thing:
 the passages below.
+
 Each passage below starts with a number like [1] followed by its document, chapter and page.
 
 Guidelines:
 - Answer naturally, as if you know the material well. Don't say "based on the context".
 - After each claim or sentence that uses a passage, cite it with its number, e.g. [2] or [1][3].
   Only cite passages you actually used. Never invent a citation.
+- Cite using ONLY plain square brackets with the passage number, like [2] or [1][3].
+  Never use 【】 brackets, "†", or line ranges like L1-L6.
 - When it matters which document something comes from, mention it (e.g. "In Book A, ...").
 - For comparisons, cover each document separately, then compare.
 - Never mix up facts between documents.
@@ -415,6 +543,7 @@ Guidelines:
 - If the passages don't contain the answer, say so honestly and don't cite anything.
 {spoiler_rule}
 {summary_rule}
+{all_rule}
 
 Conversation history:
 {history_text}
@@ -423,8 +552,8 @@ Passages:
 {context}
 
 User: {question}
-
 Answer:"""
 
-    answer = get_llm().invoke(prompt).content
+    # normalize BEFORE building sources / grounding so they see plain [n] markers
+    answer = normalize_citations(get_llm().invoke(prompt).content)
     return answer, _build_sources(answer, chunks), _grounding_check(answer, chunks)

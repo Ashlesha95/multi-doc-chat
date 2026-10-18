@@ -2,7 +2,8 @@ import streamlit as st
 import os
 import re
 import shutil
-from rag import smart_answer, get_vectorstore, get_chapters
+
+from rag import smart_answer, get_vectorstore, get_chapters, normalize_citations
 from ingest import ingest
 from viewer import render_highlighted_page
 from chat_store import (
@@ -31,8 +32,10 @@ def get_indexed_pdfs() -> list:
 
 
 def clean_answer(text: str) -> str:
-    """Hide the [1], [2] markers; the sources stay available behind the button."""
-    return CITE_RE.sub("", text)
+    """Hide the [1], [2] markers; the sources stay available behind the button.
+    Also converts model-native 【7†L1-L6】 markers first, so old saved chats
+    that still contain them render cleanly too."""
+    return CITE_RE.sub("", normalize_citations(text))
 
 
 def clear_caches():
@@ -75,7 +78,6 @@ def sources_dialog(chat_id: str, idx: int, sources: list, grounding: list):
     if not sources[0].get("cited", True):
         st.caption("The answer didn't cite anything directly. "
                    "These are the closest passages that were searched.")
-
     for i, s in enumerate(sources, 1):
         loc = f"**{i}. {s['doc']}** · {s['chapter']}"
         if s.get("page"):
@@ -178,7 +180,6 @@ with st.sidebar:
                 st.rerun()
 
     st.divider()
-
     st.subheader("✏️ New chat")
     new_chat_docs = st.multiselect("Documents", indexed, key="new_chat_docs")
     if st.button("Start chat", use_container_width=True, disabled=not new_chat_docs):
@@ -187,7 +188,6 @@ with st.sidebar:
         st.rerun()
 
     st.divider()
-
     st.subheader("💬 Chats")
     chats = get_all_chats()
     if not chats:
@@ -232,11 +232,11 @@ if set(selected) != set(chat["docs"]):
 spoiler_on = bool(chat.get("spoiler_safe"))
 
 if spoiler_on:
-    if st.button("🛡️ Spoiler-safe mode: ON  ·  click to turn off",
+    if st.button("🛡️ Spoiler-safe mode: ON · click to turn off",
                  key=f"spoil_off_{chat['id']}"):
-        confirm_spoilers_off(chat["id"])          # opens the warning popup
+        confirm_spoilers_off(chat["id"])  # opens the warning popup
 else:
-    if st.button("🛡️ Spoiler-safe mode: OFF  ·  click to turn on",
+    if st.button("🛡️ Spoiler-safe mode: OFF · click to turn on",
                  key=f"spoil_on_{chat['id']}"):
         chat["spoiler_safe"] = True
         save_chat(chat)
@@ -298,7 +298,6 @@ if not selected:
 if prompt := st.chat_input(f"Ask about {len(selected)} document(s)..."):
     with st.chat_message("user"):
         st.markdown(prompt)
-
     with st.chat_message("assistant"):
         with st.spinner("Thinking..."):
             answer, sources, grounding = smart_answer(
